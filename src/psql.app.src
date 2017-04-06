@@ -1,0 +1,12 @@
+{application, psql,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { psql_app, []}},
+  {env, []}
+ ]}.
