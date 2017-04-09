@@ -89,23 +89,19 @@ handle_call(_Msg, _From, State) ->
 	{reply, {error, nonsupport}, State}.
 
 handle_info(reconnect, #state{worker_handler = HandlerPid} = State) ->
-	lager:warning("psql_worker: reconnect ~p",[self()]),
 	HandlerPid ! {init_conn, self()},
 	{noreply, State};
 
-handle_info({connected, Conn}, State) ->
-	lager:info("psql_worker: connected: ~p",[Conn]),
+handle_info({connected, _Conn}, State) ->
 	catch erlang:cancel_timer(State#state.timer),
-	{noreply, State#state{conn_status = true, delay=?INITIAL_DELAY, timer = undefined, conn= Conn}};
+	{noreply, State#state{conn_status = true, delay=?INITIAL_DELAY, timer = undefined}};
 
 handle_info({fail_init_conn, _Why}, State) ->
-	lager:warning("psql_worker: fail_init_conn: ~p",[_Why]),
 	NewDelay = calculate_delay(State#state.delay),
 	Tref = erlang:send_after(State#state.delay, self(), reconnect),
 	{noreply, State#state{conn_status = false, delay = NewDelay, timer = Tref}};
 
 handle_info({'DOWN', Ref, _Type, _Object, _Info}, State) ->
-	lager:warning("psql_worker: DOWN: ~p; Obj: ~p",[_Info, _Object]),
 	erlang:demonitor(Ref),
 	HandlerPid = spawn_link(fun() -> worker_init(State) end),
 	erlang:monitor(process, HandlerPid),
@@ -118,16 +114,14 @@ handle_cast(_Msg, State) ->
 	{noreply, State}.
 
 
-terminate(_Reason, #state{conn = Conn} = State) ->
-	lager:info("terminate: ~p",[_Reason]),
-	epgsql:close(Conn),
+terminate(_Reason, _State) ->
 	ok.
 
 code_change(_OldVsn, State, _Extra) ->
 	{ok, State}.
 
 connect(State) ->
-	Args = [{async, self()} | State#state.start_args],
+	Args = State#state.start_args,
 	Hostname = proplists:get_value(host, Args),
 	Database = proplists:get_value(database, Args),
 	Username = proplists:get_value(username, Args),
@@ -156,9 +150,9 @@ work_loop(State) ->
 	receive
 		{init_conn, Caller} ->
 			NewState = case connect(State) of 
-			{ok,  SqlConn} ->
-				Caller ! {connected, SqlConn},
-				State#state{conn= SqlConn};
+			{ok,  Conn} ->
+				Caller ! {connected, Conn},
+				State#state{conn=Conn};
 			Error ->
 				Caller ! {fail_init_conn, Error},
 				State#state{conn = undefined}
@@ -187,9 +181,6 @@ work_loop(State) ->
 			_ ->
 				ok
 			end;
-		{epgsql, _, Notif} ->
-			lager:info("Notif: ~p", [Notif]),
-			ok;
 		_ ->
 			work_loop(State)
 	end.
