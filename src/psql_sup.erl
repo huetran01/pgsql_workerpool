@@ -11,7 +11,8 @@
 -export([add_pool/3]).
 
 %% Helper macro for declaring children of supervisor
--define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 5000, Type, [I]}).
+-define(CHILD(Name, I, Args, Type), {Name, {I, start_link, Args}, permanent, infinity, Type, [I]}).
+
 
 %% ===================================================================
 %% API functions
@@ -29,13 +30,7 @@ init([]) ->
     PoolSpec = case application:get_env(psql, pools) of 
     {ok, Pools} ->
         lists:map(fun ({PoolName, SizeArgs, WorkerArgs}) ->
-            WorkerSize = proplists:get_value(size, SizeArgs, 50),
-            PoolOptions  = [ {overrun_warning, 10000}
-                    , {overrun_handler, {psql_worker, report_overrun}}
-                    , {workers, WorkerSize}
-                    , {worker, {psql_worker, [SizeArgs ++ WorkerArgs]}}],
-            % wpool:start_pool(PoolName, PoolOptions)
-            {PoolName, {wpool, start_pool, [PoolName, PoolOptions]}, permanent, 5000, supervisor, [PoolName]}
+            ?CHILD(PoolName, psql_worker, [PoolName, SizeArgs, WorkerArgs], supervisor)
         end, Pools);
     _ ->
         []
@@ -43,11 +38,5 @@ init([]) ->
     {ok, { {one_for_one, 10, 10}, PoolSpec} }.
 
 add_pool(PoolName, SizeArgs, WorkerArgs) ->
-    WorkerSize = proplists:get_value(size, SizeArgs, 10),
-    PoolOptions  = [ {overrun_warning, 10000}
-                , {overrun_handler, {psql_worker, report_overrun}}
-                , {workers, WorkerSize}
-                , {worker, {psql_worker, [SizeArgs ++ WorkerArgs]}}],
-    Child = {PoolName, {wpool, start_pool, [PoolName, PoolOptions]}, permanent, 5000, supervisor, [PoolName]},
+    Child = ?CHILD(PoolName, psql_worker, [PoolName, SizeArgs, WorkerArgs], supervisor),
     supervisor:start_child(?MODULE, Child).
-    % wpool:start_pool(PoolName, PoolOptions).

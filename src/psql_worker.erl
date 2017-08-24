@@ -6,7 +6,7 @@
 		equery/3, equery/4,
 		with_transaction/2, with_transaction/3]).
 
--export([start_link/1]).
+-export([start_link/3]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 				 terminate/2, code_change/3]).
@@ -21,7 +21,8 @@
 					timer::timer:tref(),
 					start_args::proplists:proplist(),
 					worker_handler :: pid(),
-					conn_status :: boolean()}).
+					conn_status :: boolean(),
+					parent_pid :: pid()}).
 
 
 -type custom_strategy() :: fun(([atom()])-> Atom::atom()).
@@ -40,6 +41,18 @@
 
 -define(Strategy, next_worker).
 
+
+-spec start_link(atom(), proplists:proplist(), proplists:proplist()) -> {ok, pid()}|term().
+start_link(PoolName, SizeArgs, WorkerArgs) ->
+	WorkerSize = proplists:get_value(size, SizeArgs, 50),
+    PoolOptions  = [ {overrun_warning, 10000}
+                    , {overrun_handler, {?MODULE, report_overrun}}
+                    , {pool_sup_shutdown, 'infinity'}
+                    , {pool_sup_intensity, 10}
+                    , {pool_sup_period, 10}
+                    , {workers, WorkerSize}
+                    , {worker, {?MODULE, [SizeArgs ++ WorkerArgs]}}],
+  	wpool:start_pool(PoolName, PoolOptions).
 
 
 squery(PoolName, Sql)  ->
@@ -61,19 +74,17 @@ with_transaction(PoolName, Fun, Timeout) ->
 	wpool:call(PoolName, {transaction, Fun}, default_strategy(), Timeout).
 
 
-start_link(Args) ->
-	gen_server:start_link(?MODULE, Args, []).
-
 
 init([Args]) ->
+	process_flag(trap_exit, true),
 	State = #state{start_args = Args, delay = ?INITIAL_DELAY},
 	HandlerPid = spawn_link(fun() -> worker_init(State) end),
-	erlang:monitor(process, HandlerPid),
 	HandlerPid ! {init_conn, self()},
 	{ok, State#state{worker_handler = HandlerPid}}.
 
 handle_call(_Query, _From, #state{conn_status = false} = State) ->
 		{reply, {error, disconnected}, State};
+
 handle_call({squery, Sql}, From, #state{worker_handler = HandlerPid} = State) ->
 	HandlerPid ! {squery, From, Sql},
 	{noreply, State};
@@ -104,12 +115,22 @@ handle_info({fail_init_conn, _Why}, State) ->
 	Tref = erlang:send_after(State#state.delay, self(), reconnect),
 	{noreply, State#state{conn_status = false, delay = NewDelay, timer = Tref}};
 
-handle_info({'DOWN', Ref, _Type, _Object, _Info}, State) ->
-	lager:warning("psql_worker: DOWN: ~p; Obj: ~p",[_Info, _Object]),
-	erlang:demonitor(Ref),
-	HandlerPid = spawn_link(fun() -> worker_init(State) end),
-	erlang:monitor(process, HandlerPid),
-	{noreply, State#state{worker_handler = HandlerPid}};
+% handle_info({fail_init_conn, _Why}, State) ->
+% 	lager:info("psql_worker:  fail_init_conn: _Why: ~p",[_Why]),
+% 	{stop, normal, State };
+
+handle_info({'EXIT', Pid, Reason}, #state{worker_handler = Pid} = State) ->
+    lager:error("psql_worker: worker will reconnect ~p exited with ~p~n", [Pid, Reason]),
+    NewDelay = calculate_delay(State#state.delay),
+    Tref = erlang:send_after(State#state.delay, self(), reconnect),
+    {noreply, State#state{conn_status = false, delay = NewDelay, timer = Tref}};
+
+handle_info({'EXIT', Pid, Reason}, State) ->
+	lager:error("psql_worker: worker ~p exited with ~p~n", [Pid, Reason]),
+    %% Worker process exited for some other reason; stop this process
+    %% as well so that everything gets restarted by the sup
+    {stop, normal, State};
+
 
 handle_info(_Msg, State) ->
 	{noreply, State}.
@@ -117,10 +138,15 @@ handle_info(_Msg, State) ->
 handle_cast(_Msg, State) ->
 	{noreply, State}.
 
+terminate(_Reason, #state{worker_handler = HandlerPid} =  _State)  -> 
+	lager:info("psql_worker: terminate: Reason: ~p",[_Reason]),
+	case is_process_alive(HandlerPid) of 
+	true -> HandlerPid ! {stop, self()};
+	_ -> ok 
+	end,
+  	ok;
 
-terminate(_Reason, #state{conn = Conn} = State) ->
-	lager:warning("terminate: ~p",[_Reason]),
-	epgsql:close(Conn),
+terminate(_Reason, _State) ->
 	ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -155,6 +181,7 @@ work_loop(State) ->
 	Conn = State#state.conn,
 	receive
 		{init_conn, Caller} ->
+			lager:info("psql_worker: conn: parent_pid: ~p",[Caller]),
 			NewState = case connect(State) of 
 			{ok,  SqlConn} ->
 				Caller ! {connected, SqlConn},
@@ -163,8 +190,7 @@ work_loop(State) ->
 				Caller ! {fail_init_conn, Error},
 				State#state{conn = undefined}
 			end,
-			work_loop(NewState);
-		
+			work_loop(NewState#state{parent_pid = Caller});
 		{squery, Caller, Sql} ->
 			Result = epgsql:squery(Conn, Sql),
 			gen_server:reply(Caller, Result),
@@ -180,15 +206,26 @@ work_loop(State) ->
 			gen_server:reply(Caller, Result),
 			work_loop(State);
 		
-		{'EXIT', _From, _Reason} ->
-			case is_pid(Conn) of 
-			true -> 
-				epgsql:close(Conn);
-			_ ->
-				ok
-			end;
-		_ ->
+		{'EXIT', Pid, _Reason} ->
+			lager:warning("psql_worker: die with Pid: ~p; Reason: ~p; child ~p exit",[Pid, _Reason, self()]),
+			need_shutdown(Pid, State),
+			ok;
+		{stop, Pid} ->
+			lager:warning("psql_worker: die with Pid: ~p;  Child: ~p stop",[Pid, self()]),
+			need_shutdown(Pid, State),
+			ok;
+		Msg ->
+		 	lager:warning("psql_worker: other Signal: ~p",[Msg]),
 			work_loop(State)
+	end.
+
+need_shutdown(Pid, State) ->
+	Parent = State#state.parent_pid,
+	Conn = State#state.conn,
+	case Pid of 
+	Parent -> 
+		(catch epgsql:close(Conn));
+	_ -> ok 
 	end.
 
 -spec report_overrun(term()) -> ok.
@@ -216,3 +253,4 @@ statistic(PoolName) ->
 	    {status, WorkerStats, MsgQueueLen, Memory}
    	end || I <- lists:seq(1, length(InitWorkers))],
    	[PoolPid, Options, WorkerStatus].
+
